@@ -1,0 +1,85 @@
+"""Writes src/target_sites.h: the PlayerManager.GetPlayer calls that pick a target among the players, redirected to p3_target_player.
+
+Usage: target_sites.py DUMP MODULE OUT  (capstone; MODULE: the module without the mod, e.g. backup/main.patched.bin.before_3player)
+
+Each listed method's calls of GetPlayer(PlayerTwo) (w1 = 1), and of GetPlayer(w-register) where noted, become calls of
+p3_target_player (mod.c), which answers player two or player three. Only methods that read the players to choose or detect
+(nearest, in range, past a line, random pick) are listed: code that changes a player (cutscene moves, input locks, event handlers)
+keeps the real player two.
+"""
+import re, sys
+from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+
+GET_PLAYER = 0x40EF80
+# class::method -> also redirect GetPlayer(register) calls (the id is a stored target)
+METHODS = {
+    'AbstractPlatformingLevelEnemy::Update': False,                        # wakes when a player is in its rect
+    'AirplaneLevel.<handle_terriers_cr>c__Iterator1::MoveNext': False,     # nearest player to a terrier's shot
+    'ChessBishopLevelBishop::findMoveHorizontalInitialPosition': False,    # spawn away from the players
+    'ChessBishopLevelBishop::findMoveVerticalInitialAngle': False,
+    'ChessBishopLevelCandle::Update': False,                               # a player walking by
+    'ChessKnightLevelKnight.<long_cr>c__Iterator5::MoveNext': False,       # lunge target
+    'ChessKnightLevelKnight::CheckTaunt': False,
+    'ChessKnightLevelKnight::LevelInit': False,
+    'ChessKnightLevelKnight::shouldBackDash': False,
+    'CircusPlatformingLevelTrampoline::CheckIfShouldSleep': False,         # who it tracks
+    'DevilLevelHole.<check_player_cr>c__Iterator0::MoveNext': False,       # players dropped through the hole
+    'DicePalaceBoozeLevelDecanter.<attack_cr>c__Iterator0::MoveNext': False,
+    'DicePalaceBoozeLevelDecanter.<spray_cr>c__Iterator1::MoveNext': True,
+    'FlyingBirdLevelNurses.<attack_cr>c__Iterator0::MoveNext': False,
+    'FlyingBirdLevelNursePill.<detonate_cr>c__Iterator1::MoveNext': True,
+    'ForestPlatformingLevelChomperSpawner::Update': False,
+    'FrogsLevelBisonBullet.<bison_cr>c__Iterator1::MoveNext': False,
+    'LevelCoin::Update': False,                                            # coins
+    'LevelPit::FixedUpdate': False,                                        # pits knock the player back up
+    'MountainPlatformingLevelCyclopsPeek.<check_player_cr>c__Iterator0::MoveNext': False,
+    'OldManLevelSpikeFloor::MinDistanceToPlayer': False,
+    'PirateLevelBarrel::Update': False,
+    'PlatformingLevelEnemySpawner::Update': False,
+    'PlatformingLevelExit::FixedUpdate': False,                           # the run & gun's finish line
+    'RobotLevelRobotHead::OnPrimaryAttack': False,
+    'RumRunnersLevelMine.<check_distance_cr>c__Iterator1::MoveNext': False,
+    'RumRunnersLevelSpider.<mine_cr>c__Iterator4::MoveNext': False,
+    'RumRunnersLevelWorm.<spawnRunners_cr>c__Iterator5::MoveNext': False,
+    'SallyStagePlayLevelMeteor::ParryStar': False,
+    'SallyStagePlayLevelSally.<slide_cr>c__IteratorE::MoveNext': False,
+    'SnowCultLevel.<to_phase_3_cr>c__Iterator4::MoveNext': False,
+}
+
+dump, module, out = sys.argv[1:4]
+img = open(module, 'rb').read()
+img_name = None; cls = None; ms = []
+for line in open(dump):
+    if line.startswith('// '): img_name = line[3:].strip(); continue
+    m = re.match(r'class (\S+)', line)
+    if m: cls = m.group(1); continue
+    m = re.search(r'(\S+)\((.*)\);  // main\+(0x[0-9a-f]+)', line)
+    if m: ms.append((int(m.group(3), 16), cls, m.group(1), img_name))
+ms.sort()
+md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+found = {}
+lines = []
+for i, (a, c, n, im) in enumerate(ms):
+    name = '%s::%s' % (c, n)
+    if im != 'Assembly-CSharp.dll' or name not in METHODS: continue
+    end = ms[i + 1][0]
+    ins = list(md.disasm_lite(img[a:end], a))
+    for k, (addr, size, mn, op) in enumerate(ins):
+        if mn != 'bl' or int(op.lstrip('#'), 16) != GET_PLAYER: continue
+        idv = None
+        for k2 in range(k - 1, max(k - 12, -1), -1):
+            _, _, m2, o2 = ins[k2]; o2 = o2.replace(' ', '')
+            if o2.startswith('w1,') or o2.startswith('x1,'):
+                idv = o2.split('#')[-1] if '#' in o2 and m2 in ('mov', 'orr', 'movz') else ('0' if o2 in ('w1,wzr', 'x1,xzr') else 'reg')
+                break
+            if m2 in ('bl', 'b', 'blr', 'ret'): break
+        if idv == '1' or (idv == 'reg' and METHODS[name]):
+            word = int.from_bytes(img[addr:addr + 4], 'little')
+            lines.append('HOOK_CALL(t_%x, 0x%x, 0x%08x, p3_target_player);   // %s, %s' % (addr, addr, word, name, 'GetPlayer(PlayerTwo)' if idv == '1' else 'GetPlayer(id)'))
+            found[name] = found.get(name, 0) + 1
+missing = [m for m in METHODS if m not in found]
+assert not missing, 'no redirected call in %s' % missing
+with open(out, 'w') as f:
+    f.write('// Generated by tools/target_sites.py: GetPlayer calls that pick a target, redirected to p3_target_player (mod.c)\n')
+    f.write('\n'.join(lines) + '\n')
+print('%d calls in %d methods -> %s' % (len(lines), len(found), out))

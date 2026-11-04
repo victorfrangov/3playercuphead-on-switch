@@ -1,0 +1,11 @@
+# Game files and anything built from them: never committed
+build/
+backup/
+romfs/
+*.bin
+*.assets
+*.dat
+*_dump.cs
+spike_shots/
+__pycache__/
+.DS_Store
